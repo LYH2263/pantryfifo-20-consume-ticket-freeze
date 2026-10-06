@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from app import seed
 from app.db import connect
 from app.engines.fefo import consume_fefo, expire_lots
+from app.ticket import TICKET_VERSION, classify
 
 app = FastAPI(title="Pantryfifo", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -74,21 +75,73 @@ class ConsumeIn(BaseModel):
 @app.post("/api/consume")
 def consume(body: ConsumeIn):
     c = connect()
+    item = c.execute("SELECT * FROM items WHERE id=?", (body.item_id,)).fetchone()
+    if not item:
+        c.close(); raise HTTPException(404, "item")
     lots = [dict(r) for r in c.execute(
         "SELECT * FROM lots WHERE item_id=? AND status='on_shelf' AND qty_remain>0", (body.item_id,))]
     result = consume_fefo(lots, body.qty)
     if not result["ok"] and result["reason"] == "qty_non_positive":
         c.close(); raise HTTPException(400, result["reason"])
     if not result["ok"]:
+        # 失败的确认:零写入,不留可打开的假票
         c.close(); raise HTTPException(409, result)
-    for d in result["deductions"]:
-        c.execute("UPDATE lots SET qty_remain = qty_remain - ? WHERE id=?", (d["take"], d["lot_id"]))
-        rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
-        if rem <= 0:
-            c.execute("UPDATE lots SET status='consumed', qty_remain=0 WHERE id=?", (d["lot_id"],))
-    c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
-              (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
-    c.commit(); c.close(); return result
+    row = c.execute("SELECT value FROM settings WHERE key='warn_days'").fetchone()
+    ticket = {
+        "v": TICKET_VERSION,
+        "item_id": item["id"],
+        "item_name": item["name"],
+        "unit": item["unit"],
+        "qty": body.qty,
+        "warn_days": int(row["value"]) if row else None,
+        "deductions": result["deductions"],
+    }
+    try:
+        for d in result["deductions"]:
+            c.execute("UPDATE lots SET qty_remain = qty_remain - ? WHERE id=?", (d["take"], d["lot_id"]))
+            rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
+            if rem <= 0:
+                c.execute("UPDATE lots SET status='consumed', qty_remain=0 WHERE id=?", (d["lot_id"],))
+        cur = c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
+                        (body.note, json.dumps(ticket, ensure_ascii=False), datetime.now(timezone.utc).isoformat()))
+        c.commit()
+    except Exception:
+        c.rollback(); c.close()
+        raise HTTPException(500, "consume_persist_failed")
+    cid = cur.lastrowid
+    c.close()
+    return {"id": cid, "ticket": ticket}
+
+@app.get("/api/consumptions")
+def consumptions():
+    c = connect()
+    rows = [dict(r) for r in c.execute("SELECT * FROM consumptions ORDER BY id DESC")]
+    c.close()
+    out = []
+    for r in rows:
+        cls = classify(r["result_json"])
+        entry = {"id": r["id"], "note": r["note"], "created_at": r["created_at"], "state": cls["state"]}
+        t = cls.get("ticket")
+        if t:
+            entry["item_name"] = t.get("item_name")
+            entry["qty"] = t.get("qty")
+        out.append(entry)
+    return out
+
+@app.get("/api/consumptions/{cid}")
+def consumption_detail(cid: int):
+    c = connect()
+    r = c.execute("SELECT * FROM consumptions WHERE id=?", (cid,)).fetchone()
+    c.close()
+    if not r:
+        raise HTTPException(404, "consumption")
+    cls = classify(r["result_json"])
+    out = {"id": r["id"], "note": r["note"], "created_at": r["created_at"], "state": cls["state"]}
+    if cls["state"] == "corrupt":
+        out["raw"] = cls["raw"]
+    else:
+        out["ticket"] = cls["ticket"]
+    return out
 
 @app.post("/api/expire-sweep")
 def expire_sweep():

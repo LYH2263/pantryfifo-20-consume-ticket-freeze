@@ -10,6 +10,15 @@ def test_fefo_order():
     assert r["ok"] and r["deductions"][0]["lot_id"] == 1 and r["deductions"][0]["take"] == 2
     assert r["deductions"][1]["take"] == 1
 
+def test_deductions_carry_remaining_snapshot():
+    lots = [
+        {"id": 1, "qty_remain": 2, "expiry": "2026-01-10"},
+        {"id": 2, "qty_remain": 3, "expiry": "2026-02-01"},
+    ]
+    r = consume_fefo(lots, 3)
+    assert r["deductions"][0]["remain_before"] == 2 and r["deductions"][0]["remain_after"] == 0
+    assert r["deductions"][1]["remain_before"] == 3 and r["deductions"][1]["remain_after"] == 2
+
 def test_short():
     r = consume_fefo([{"id": 1, "qty_remain": 1, "expiry": "2026-01-01"}], 5)
     assert r["ok"] is False and r["short"] == 4

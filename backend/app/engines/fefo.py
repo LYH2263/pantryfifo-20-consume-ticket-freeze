@@ -18,7 +18,13 @@ def consume_fefo(lots: list[dict], qty: float) -> dict:
             break
         avail = float(lot["qty_remain"])
         take = min(avail, need)
-        deductions.append({"lot_id": lot["id"], "take": take, "expiry": lot.get("expiry")})
+        deductions.append({
+            "lot_id": lot["id"],
+            "take": take,
+            "expiry": lot.get("expiry"),
+            "remain_before": avail,
+            "remain_after": round(avail - take, 6),
+        })
         need -= take
     if need > 1e-9:
         return {"ok": False, "reason": "short", "deductions": deductions, "short": round(need, 3)}
